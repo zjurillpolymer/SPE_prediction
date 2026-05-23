@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .idea/
 *.pt
+polyinfo_*_pred.csv

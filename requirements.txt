@@ -1,0 +1,6 @@
+torch
+torch_geometric
+torch_scatter
+rdkit
+pandas
+numpy
