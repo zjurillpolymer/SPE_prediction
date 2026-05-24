@@ -15,25 +15,30 @@ HIDDEN_DIM = 128
 BATCH_SIZE = 32
 EPOCHS = 100
 LR = 1e-3
-EXTRA_COLS = ['mw', 'molality', 'inv_temp', 'anion_volume', 'anion_mass', 'anion_charge']
+EXTRA_COLS = ['mw', 'molality', 'anion_volume', 'anion_mass', 'anion_charge']
 # ────────────────────────────────────────────────────────
 
 class SPE_Predictor(nn.Module):
+    """Arrhenius output layer: predicts A and Ea/R, then log σ = A - Ea/R · 1/T."""
+
     def __init__(self, node_in_dims=31, edge_dim=6, hidden_dim=HIDDEN_DIM,
-                 num_layers=6, extra_dim=6, dropout=0.1):
+                 num_layers=6, extra_dim=5, dropout=0.1):
         super().__init__()
         self.encoder = MPNNEmbedding(node_in_dims, edge_dim, hidden_dim, num_layers)
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim + extra_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1),
+            nn.Linear(64, 2),  # A, Ea/R
         )
 
     def forward(self, data):
         emb = self.encoder(data)
         emb = torch.cat([emb, data.extra], dim=-1)
-        return self.regressor(emb).squeeze(-1)
+        params = self.regressor(emb)               # [B, 2]
+        A, EaR = params[:, 0:1], params[:, 1:2]
+        cond = A - EaR * data.inv_temp             # Arrhenius: [B, 1]
+        return cond.squeeze(-1)
 
 
 def train():
@@ -54,10 +59,10 @@ def train():
     valid_df = df.iloc[idx[n_train:n_train + n_valid]].copy()
     test_df  = df.iloc[idx[n_train + n_valid:]].copy()
 
-    # Normalize extra features and target using training set stats
+    # Normalize extra features (5 cols, NO inv_temp) and target
     extra_mean = train_df[EXTRA_COLS].mean().values.astype(np.float32)
     extra_std = train_df[EXTRA_COLS].std().values.astype(np.float32)
-    extra_std[extra_std == 0] = 1.0  # avoid div by zero
+    extra_std[extra_std == 0] = 1.0
 
     y_mean = train_df['conductivity'].mean().astype(np.float32)
     y_std = train_df['conductivity'].std().astype(np.float32)
@@ -65,6 +70,7 @@ def train():
     def normalize(df_):
         df_[EXTRA_COLS] = (df_[EXTRA_COLS] - extra_mean) / extra_std
         df_['conductivity'] = (df_['conductivity'] - y_mean) / y_std
+        # inv_temp stays RAW — used in physical Arrhenius formula
         return df_
 
     train_df = normalize(train_df)

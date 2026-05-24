@@ -11,6 +11,7 @@ import shap
 from encoder.MPNN import MPNNEmbedding
 from decoder.dataloader import SPEdataset, spe_collate, compute_anion_features
 from decoder.spe_prediction import SPE_Predictor, EXTRA_COLS
+EXTRA_COLS_ORIG = [c for c in EXTRA_COLS]  # keep before any mutation
 
 BATCH_SIZE = 64
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -46,28 +47,34 @@ model.eval()
 # ─── Pre-compute MPNN embeddings ────────────────────────
 all_emb = []
 all_extra = []
+all_inv_temp = []
 with torch.no_grad():
     for batch in loader:
         batch = batch.to(DEVICE)
         emb = model.encoder(batch)
         all_emb.append(emb.cpu())
         all_extra.append(batch.extra.cpu())
+        all_inv_temp.append(batch.inv_temp.cpu())
 
-all_emb = torch.cat(all_emb, dim=0).numpy()     # [N, 128]
-all_extra = torch.cat(all_extra, dim=0).numpy()  # [N, 6]
+all_emb = torch.cat(all_emb, dim=0).numpy()         # [N, 128]
+all_extra = torch.cat(all_extra, dim=0).numpy()      # [N, 5]
+all_inv_temp = torch.cat(all_inv_temp, dim=0).numpy() # [N, 1]
 
-# ─── SHAP (fixed embedding approach) ────────────────────
-# Use mean embedding as a fixed "background polymer",
-# so SHAP isolates the effect of extra features only.
-mean_emb = all_emb.mean(0, keepdims=True)  # [1, 128]
+# ─── SHAP (fixed embedding + fixed inv_temp) ───────────
+# Isolate the effect of the 5 extra features on the full Arrhenius output.
+mean_emb = all_emb.mean(0, keepdims=True)           # [1, 128]
+mean_inv_t = float(all_inv_temp.mean())
 
 def predict_fn(extra_feats):
-    """Same mean embedding for every sample — explains extra features alone."""
+    """Fixed embedding + fixed inv_temp; perturb only the 5 extra features."""
     emb = np.tile(mean_emb, (len(extra_feats), 1))
     combined = np.concatenate([emb, extra_feats], axis=1)
     combined_t = torch.tensor(combined, dtype=torch.float, device=DEVICE)
     with torch.no_grad():
-        return model.regressor(combined_t).squeeze(-1).cpu().numpy()
+        params = model.regressor(combined_t)          # [B, 2]
+        A, EaR = params[:, 0:1], params[:, 1:2]
+        cond = A - EaR * mean_inv_t                   # Arrhenius
+        return cond.squeeze(-1).cpu().numpy()
 
 N_BG = 100
 N_EXPLAIN = 300

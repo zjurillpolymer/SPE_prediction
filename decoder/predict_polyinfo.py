@@ -69,6 +69,7 @@ def predict_polyinfo(polyinfo_path, model, extra_mean, extra_std, y_mean, y_std,
     # Build graphs
     graphs = []
     extras = []
+    inv_temps = []
     fail = 0
     for idx in range(len(df)):
         row = df.iloc[idx]
@@ -79,17 +80,17 @@ def predict_polyinfo(polyinfo_path, model, extra_mean, extra_std, y_mean, y_std,
         graphs.append(molecule_to_graph.mol_to_pyg_graph(mol))
         extra = [row[col] for col in EXTRA_COLS]
         extras.append(torch.tensor(extra, dtype=torch.float))
+        inv_temps.append(torch.tensor([row['inv_temp']], dtype=torch.float))
 
     if fail:
         print(f"Warning: {fail} molecules failed graph conversion.")
 
     # Batch
-    for g in graphs:
-        g.extra = None  # will be set manually
     batch = Batch.from_data_list(graphs)
     batch.extra = torch.stack(extras, dim=0)
+    batch.inv_temp = torch.stack(inv_temps, dim=0)
 
-    # Normalize extras
+    # Normalize extras only (inv_temp is raw for Arrhenius)
     batch.extra = (batch.extra - torch.tensor(extra_mean)) / torch.tensor(extra_std)
 
     # Predict

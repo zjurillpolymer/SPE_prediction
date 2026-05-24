@@ -48,7 +48,7 @@ def compute_anion_features(salt_smiles):
 
 
 class SPEdataset(Dataset):
-    EXTRA_FEATURES = ['mw', 'molality', 'inv_temp',
+    EXTRA_FEATURES = ['mw', 'molality',
                       'anion_volume', 'anion_mass', 'anion_charge']
 
     def __init__(self, df, task='conductivity', cache_path=None):
@@ -60,19 +60,21 @@ class SPEdataset(Dataset):
             cached = torch.load(cache_path, weights_only=False)
             self.data_list = cached['data_list']
             self.extra_list = cached['extra_list']
+            self.inv_temp_list = cached['inv_temp_list']
             self.y_list = cached['y_list']
         else:
-            self.data_list, self.extra_list, self.y_list = self._preprocess()
+            self.data_list, self.extra_list, self.inv_temp_list, self.y_list = self._preprocess()
             if cache_path:
                 torch.save({
                     'data_list': self.data_list,
                     'extra_list': self.extra_list,
+                    'inv_temp_list': self.inv_temp_list,
                     'y_list': self.y_list,
                 }, cache_path)
                 print(f"Cache saved: {cache_path}")
 
     def _preprocess(self):
-        data_list, extra_list, y_list = [], [], []
+        data_list, extra_list, inv_temp_list, y_list = [], [], [], []
         fail = 0
         for idx in range(len(self.df)):
             row = self.df.iloc[idx]
@@ -84,10 +86,14 @@ class SPEdataset(Dataset):
                 continue
             data_list.append(molecule_to_graph.mol_to_pyg_graph(mol))
 
-            # Extra features — read from pre-computed columns in df
+            # Extra features without inv_temp
             extra = [0.0 if pd.isna(row[col]) else row[col]
                      for col in self.EXTRA_FEATURES]
             extra_list.append(torch.tensor(extra, dtype=torch.float))
+
+            # Raw inv_temp for Arrhenius formula
+            inv_temp_list.append(torch.tensor(
+                [np.nan_to_num(row['inv_temp'], nan=0.0)], dtype=torch.float))
 
             # Label
             y_list.append(torch.tensor(
@@ -95,20 +101,25 @@ class SPEdataset(Dataset):
 
         if fail:
             print(f"Warning: {fail} invalid SMILES skipped.")
-        return data_list, extra_list, y_list
+        return data_list, extra_list, inv_temp_list, y_list
 
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
-        return self.data_list[idx].clone(), self.extra_list[idx].clone(), self.y_list[idx].clone()
+        return (self.data_list[idx].clone(),
+                self.extra_list[idx].clone(),
+                self.inv_temp_list[idx].clone(),
+                self.y_list[idx].clone())
 
 
 def spe_collate(batch):
     data_list = [item[0] for item in batch]
-    extras = torch.stack([item[1] for item in batch], dim=0)  # [B, 6]
-    ys = torch.cat([item[2] for item in batch], dim=0)        # [B]
+    extras = torch.stack([item[1] for item in batch], dim=0)   # [B, 5]
+    inv_temps = torch.stack([item[2] for item in batch], dim=0) # [B, 1]
+    ys = torch.cat([item[3] for item in batch], dim=0)          # [B]
     batch_data = Batch.from_data_list(data_list)
     batch_data.extra = extras
+    batch_data.inv_temp = inv_temps
     batch_data.y = ys
     return batch_data
