@@ -80,7 +80,6 @@ def predict_params(smiles, salt_smi, cond):
     inv_temp = torch.tensor([[inv_t]], dtype=torch.float)
 
     with torch.no_grad():
-        # Extract A and Ea/R from the trained regressor
         h = model.projection(emb.to(DEVICE))
         h = torch.cat([h, extra_norm.to(DEVICE)], dim=-1)
         params = model.regressor(h)

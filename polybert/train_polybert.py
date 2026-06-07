@@ -15,14 +15,14 @@ from decoder.dataloader import compute_anion_features
 POLYBERT_MODEL = 'xushijie/polyBERT'
 HIDDEN_DIM = 128
 BATCH_SIZE = 32
-EPOCHS = 100
+EPOCHS = 500
 LR = 1e-3
 EXTRA_COLS = ['mw', 'molality', 'anion_volume', 'anion_mass', 'anion_charge']
 # ────────────────────────────────────────────────────────
 
 
 class PolyBERT_Dataset(Dataset):
-    """Dataset that provides precomputed polyBERT embeddings + extra features."""
+    """Precompute polyBERT embeddings; fast training without full DeBERTa forward pass."""
 
     def __init__(self, df, polybert_model, cache_path=None):
         self.df = df.reset_index(drop=True)
@@ -71,7 +71,6 @@ class PolyBERT_Dataset(Dataset):
             self.extras.append(torch.tensor(extra, dtype=torch.float))
             self.inv_temps.append(torch.tensor([row['inv_temp']], dtype=torch.float))
             self.ys.append(torch.tensor([row['conductivity']], dtype=torch.float))
-
         if fail:
             print(f"Warning: {fail} rows skipped (missing embedding).")
 
@@ -84,17 +83,17 @@ class PolyBERT_Dataset(Dataset):
 
 
 def collate_fn(batch):
-    embs = torch.stack([b[0] for b in batch])       # [B, 600]
-    extras = torch.stack([b[1] for b in batch])      # [B, 5]
-    inv_temps = torch.stack([b[2] for b in batch])   # [B, 1]
-    ys = torch.cat([b[3] for b in batch])            # [B]
+    embs = torch.stack([b[0] for b in batch])
+    extras = torch.stack([b[1] for b in batch])
+    inv_temps = torch.stack([b[2] for b in batch])
+    ys = torch.cat([b[3] for b in batch])
     return embs, extras, inv_temps, ys
 
 
 class PolyBERT_SPE_Predictor(nn.Module):
-    """polyBERT encoder (frozen) + Arrhenius output layer."""
+    """Simple projection on frozen polyBERT embeddings + Arrhenius output."""
 
-    def __init__(self, polybert_dim=600, hidden_dim=128, extra_dim=5, dropout=0.1):
+    def __init__(self, polybert_dim=600, hidden_dim=128, extra_dim=5, dropout=0.15):
         super().__init__()
         self.projection = nn.Sequential(
             nn.Linear(polybert_dim, hidden_dim),
@@ -105,15 +104,15 @@ class PolyBERT_SPE_Predictor(nn.Module):
             nn.Linear(hidden_dim + extra_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 2),  # A, Ea/R
+            nn.Linear(64, 2),
         )
 
     def forward(self, emb, extra, inv_temp):
         h = self.projection(emb)
         h = torch.cat([h, extra], dim=-1)
-        params = self.regressor(h)        # [B, 2]
+        params = self.regressor(h)
         A, EaR = params[:, 0:1], params[:, 1:2]
-        cond = A - EaR * inv_temp          # Arrhenius: [B, 1]
+        cond = A - EaR * inv_temp
         return cond.squeeze(-1)
 
 
@@ -121,14 +120,14 @@ def train():
     df = pd.read_csv('data/clean_train_data.csv')
     df['inv_temp'] = 1.0 / (df['temperature'] + 273.15)
 
-    # Anion features — compute once per unique salt
+    # Anion features
     unique_salts = df['salt smiles'].fillna('').unique()
     salt_feat_map = {s: compute_anion_features(s if s else None) for s in unique_salts}
     anion_feats = df['salt smiles'].fillna('').map(salt_feat_map)
     df[['anion_volume', 'anion_mass', 'anion_charge']] = pd.DataFrame(
         anion_feats.tolist(), index=df.index)
 
-    # Train/valid/test split (same seed as baseline for fairness)
+    # Split
     np.random.seed(42)
     idx = np.random.permutation(len(df))
     n_train, n_valid = int(len(df) * 0.8), int(len(df) * 0.1)
@@ -136,7 +135,7 @@ def train():
     valid_df = df.iloc[idx[n_train:n_train + n_valid]].copy()
     test_df  = df.iloc[idx[n_train + n_valid:]].copy()
 
-    # Normalize extra features
+    # Normalize
     extra_mean = train_df[EXTRA_COLS].mean().values.astype(np.float32)
     extra_std = train_df[EXTRA_COLS].std().values.astype(np.float32)
     extra_std[extra_std == 0] = 1.0
@@ -152,10 +151,10 @@ def train():
     valid_df = normalize(valid_df)
     test_df  = normalize(test_df)
 
-    # Load polyBERT encoder
-    print(f"Loading polyBERT model: {POLYBERT_MODEL}")
+    # PolyBERT encoder (frozen)
+    print(f"Loading {POLYBERT_MODEL} ...")
     polybert_model = SentenceTransformer(POLYBERT_MODEL)
-    polybert_model.eval()  # never train
+    polybert_model.eval()
 
     # Datasets
     train_ds = PolyBERT_Dataset(train_df, polybert_model, 'polybert/cache_train.pt')
@@ -169,8 +168,16 @@ def train():
     # Model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = PolyBERT_SPE_Predictor().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {total:,}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     loss_fn = nn.MSELoss()
+
+    best_val = float('inf')
+    best_epoch = 0
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -195,9 +202,15 @@ def train():
 
         avg_train = total_loss / len(train_ds)
         avg_val = val_loss / len(valid_ds)
-        print(f"Epoch {epoch:3d}  |  train: {avg_train:.4f}  |  val: {avg_val:.4f}")
+        scheduler.step()
 
-    # Test
+        if avg_val < best_val:
+            best_val = avg_val
+            best_epoch = epoch
+
+        if epoch % 25 == 0 or epoch == 1:
+            print(f"Epoch {epoch:4d}  |  train: {avg_train:.4f}  |  val: {avg_val:.4f}  |  lr: {scheduler.get_last_lr()[0]:.2e}")
+
     model.eval()
     test_loss = 0
     with torch.no_grad():
@@ -206,10 +219,11 @@ def train():
             pred = model(emb, extra, inv_temp)
             test_loss += loss_fn(pred, y).item() * emb.size(0)
     test_loss /= len(test_ds)
-    print(f"\nTest loss (normalized):   {test_loss:.4f}")
+
+    print(f"\nBest val: {best_val:.4f} @ epoch {best_epoch}")
+    print(f"Test loss (normalized):   {test_loss:.4f}")
     print(f"Test loss (original scale): {test_loss * y_std**2:.4f}")
 
-    # Save
     torch.save(model.state_dict(), 'polybert/model.pt')
     print("Model saved: polybert/model.pt")
 
