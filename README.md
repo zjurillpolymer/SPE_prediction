@@ -47,6 +47,35 @@ Flexibility only translates to conductivity when sufficient Li⁺ coordination s
 | Without anion features | 0.65 |
 | With anion features | 0.49 |
 | **Arrhenius output layer** | **0.54** |
+| **polyBERT encoder (frozen + 500 epoch)** | **0.46** |
+
+## polyBERT Experiment
+
+polyBERT (DeBERTa-based chemical language model, pre-trained on 100M hypothetical polymers) replaces the MPNN encoder while keeping the Arrhenius physics output layer.
+
+### Architecture
+
+```
+SMILES → PSMILES → polyBERT (frozen) → 600-dim → Projection(600→128) → concat(extra) → Regressor → [A, Ea/R]
+```
+
+### Result: polyBERT beats MPNN
+
+| Model | Test loss (original) | Ea (PEG) | Ea (PP) |
+|-------|---------------------|----------|---------|
+| MPNN (Arrhenius) | 0.54 | ~18 kJ/mol | ~23 kJ/mol |
+| polyBERT (100 epoch) | 0.59 | ~20 kJ/mol | ~25 kJ/mol |
+| **polyBERT (500 epoch, cosine)** | **0.46** | ~19-26 kJ/mol | ~13-19 kJ/mol |
+
+16% improvement over the MPNN baseline. Key insight: **cosine annealing + more epochs** let the frozen embeddings plateau much lower (val loss kept improving until epoch 400+).
+
+### Caveat: no fine-tuning
+
+Full DeBERTa fine-tuning is too slow (~30 min/epoch) to be practical. Frozen embeddings with a simple 85k-parameter MLP head achieve the best test loss while preserving Arrhenius physics. A deeper head (1.4M params) overfits and produces physically wrong Ea ordering.
+
+### Reproducibility
+
+The polyBERT experiment lives on the `polybert-integration` branch.
 
 ## Project Structure
 
@@ -71,12 +100,18 @@ figures/
 ├── analyze_similarity.py   # Chemical similarity analysis
 ├── analyze_outliers.py     # Outlier pattern analysis
 └── *.png                   # Generated figures
+
+polybert/                          # polyBERT encoder experiment
+├── smiles_to_psmiles.py           # SMILES → PSMILES conversion
+├── train_polybert.py              # Training pipeline
+├── compute_ea.py                  # Activation energy analysis
+└── model.pt                       # Trained weights
 ```
 
 ## Usage
 
 ```bash
-# Train
+# Train (MPNN baseline)
 python decoder/spe_prediction.py
 
 # Predict on PolyInfo
@@ -88,6 +123,10 @@ python decoder/compute_ea.py
 # Generate figures
 python figures/plot_arrhenius.py
 python figures/plot_flexibility_faceted.py
+
+# polyBERT experiment (requires sentence-transformers)
+python polybert/train_polybert.py
+python polybert/compute_ea.py
 ```
 
 ## Requirements
